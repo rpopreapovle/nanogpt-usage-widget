@@ -8,6 +8,7 @@ import org.json.JSONObject;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.text.SimpleDateFormat;
@@ -29,7 +30,7 @@ final class UsageRepo {
 
     static final ExecutorService POOL = Executors.newSingleThreadExecutor();
     private static final String PREFS = "nanogpt";
-    private static final String UA = "NanoGptWidget/1.0 (Android)";
+    private static final String UA = "NanoGptWidget/1.1 (Android)";
 
     private UsageRepo() {}
 
@@ -78,10 +79,15 @@ final class UsageRepo {
             } else {
                 try {
                     fetchBalance(ctx, key);
-                    fetchToday(ctx, key);
                     ok = true;
                 } catch (Exception e) {
                     err = e.getMessage();
+                }
+                // траты за день — отдельно, чтобы сбой одного запроса не ломал второй
+                try {
+                    fetchToday(ctx, key);
+                } catch (Exception e) {
+                    if (err == null) err = e.getMessage();
                 }
             }
             final boolean fok = ok;
@@ -93,8 +99,9 @@ final class UsageRepo {
         });
     }
 
+    /** POST /api/check-balance — именно POST, GET даёт 405. */
     private static void fetchBalance(Context ctx, String key) throws Exception {
-        String body = get("https://nano-gpt.com/api/check-balance", key);
+        String body = post("https://nano-gpt.com/api/check-balance", key, "{}");
         JSONObject o = new JSONObject(body);
         String usd = o.optString("usd_balance", null);
         if (usd == null || usd.isEmpty()) throw new Exception("нет usd_balance в ответе");
@@ -151,13 +158,30 @@ final class UsageRepo {
     }
 
     private static String get(String url, String key) throws Exception {
+        return call("GET", url, key, null);
+    }
+
+    private static String post(String url, String key, String json) throws Exception {
+        return call("POST", url, key, json);
+    }
+
+    private static String call(String method, String url, String key, String json) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setConnectTimeout(12000);
         c.setReadTimeout(12000);
+        c.setRequestMethod(method);
         c.setRequestProperty("User-Agent", UA);
         c.setRequestProperty("Accept", "application/json");
         c.setRequestProperty("Authorization", "Bearer " + key);
         c.setRequestProperty("x-api-key", key);
+        if (json != null) {
+            c.setDoOutput(true);
+            c.setRequestProperty("Content-Type", "application/json");
+            c.setFixedLengthStreamingMode(json.getBytes("UTF-8").length);
+            try (OutputStream os = c.getOutputStream()) {
+                os.write(json.getBytes("UTF-8"));
+            }
+        }
         try {
             int code = c.getResponseCode();
             StringBuilder sb = new StringBuilder();
@@ -166,7 +190,9 @@ final class UsageRepo {
                 String line;
                 while (r != null && (line = r.readLine()) != null) sb.append(line);
             }
-            if (code != 200) throw new Exception("HTTP " + code + (sb.length() > 0 ? ": " + shorten(sb.toString()) : ""));
+            if (code < 200 || code >= 300) {
+                throw new Exception("HTTP " + code + (sb.length() > 0 ? ": " + shorten(sb.toString()) : ""));
+            }
             return sb.toString();
         } finally {
             c.disconnect();
